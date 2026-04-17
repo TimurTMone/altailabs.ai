@@ -1,4 +1,4 @@
-import { kv } from "@vercel/kv";
+import Redis from "ioredis";
 
 export interface Lead {
   id: string;
@@ -28,10 +28,40 @@ export interface ChatSession {
 const LEADS_INDEX = "leads:index";
 const CHATS_INDEX = "chats:index";
 
-function isKvConfigured(): boolean {
-  return Boolean(
-    process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN
-  );
+let client: Redis | null = null;
+let warned = false;
+
+function getClient(): Redis | null {
+  if (client) return client;
+  const url = process.env.REDIS_URL;
+  if (!url) {
+    if (!warned) {
+      console.warn(
+        "[kv] REDIS_URL not set — lead + chat persistence disabled."
+      );
+      warned = true;
+    }
+    return null;
+  }
+  client = new Redis(url, {
+    maxRetriesPerRequest: 3,
+    lazyConnect: false,
+  });
+  client.on("error", (err) => console.error("[kv] redis error:", err.message));
+  return client;
+}
+
+async function safeGet<T>(key: string): Promise<T | null> {
+  const r = getClient();
+  if (!r) return null;
+  const raw = await r.get(key);
+  return raw ? (JSON.parse(raw) as T) : null;
+}
+
+async function safeSet(key: string, value: unknown): Promise<void> {
+  const r = getClient();
+  if (!r) return;
+  await r.set(key, JSON.stringify(value));
 }
 
 // === LEADS ===
@@ -39,29 +69,26 @@ function isKvConfigured(): boolean {
 export async function saveLead(
   lead: Omit<Lead, "id" | "timestamp" | "handled">
 ): Promise<Lead | null> {
-  if (!isKvConfigured()) return null;
+  const r = getClient();
+  if (!r) return null;
 
   const id = crypto.randomUUID();
   const timestamp = Date.now();
   const record: Lead = { ...lead, id, timestamp, handled: false };
 
-  await kv.set(`lead:${id}`, record);
-  await kv.zadd(LEADS_INDEX, { score: timestamp, member: id });
-
+  await safeSet(`lead:${id}`, record);
+  await r.zadd(LEADS_INDEX, timestamp, id);
   return record;
 }
 
 export async function getLeads(limit = 100): Promise<Lead[]> {
-  if (!isKvConfigured()) return [];
+  const r = getClient();
+  if (!r) return [];
 
-  const ids = await kv.zrange<string[]>(LEADS_INDEX, 0, limit - 1, {
-    rev: true,
-  });
+  const ids = await r.zrevrange(LEADS_INDEX, 0, limit - 1);
   if (!ids || ids.length === 0) return [];
 
-  const leads = await Promise.all(
-    ids.map((id) => kv.get<Lead>(`lead:${id}`))
-  );
+  const leads = await Promise.all(ids.map((id) => safeGet<Lead>(`lead:${id}`)));
   return leads.filter((l): l is Lead => l !== null);
 }
 
@@ -69,10 +96,9 @@ export async function markLeadHandled(
   id: string,
   handled: boolean
 ): Promise<void> {
-  if (!isKvConfigured()) return;
-  const lead = await kv.get<Lead>(`lead:${id}`);
-  if (!lead) return;
-  await kv.set(`lead:${id}`, { ...lead, handled });
+  const existing = await safeGet<Lead>(`lead:${id}`);
+  if (!existing) return;
+  await safeSet(`lead:${id}`, { ...existing, handled });
 }
 
 // === CHATS ===
@@ -82,10 +108,11 @@ export async function saveChatMessage(
   userMessage: string,
   assistantReply: string
 ): Promise<void> {
-  if (!isKvConfigured()) return;
+  const r = getClient();
+  if (!r) return;
 
   const now = Date.now();
-  const existing = await kv.get<ChatSession>(`chat:${sessionId}`);
+  const existing = await safeGet<ChatSession>(`chat:${sessionId}`);
 
   const newMessages: ChatMessage[] = [
     { role: "user", content: userMessage, timestamp: now },
@@ -107,20 +134,19 @@ export async function saveChatMessage(
         messages: newMessages,
       };
 
-  await kv.set(`chat:${sessionId}`, session);
-  await kv.zadd(CHATS_INDEX, { score: now, member: sessionId });
+  await safeSet(`chat:${sessionId}`, session);
+  await r.zadd(CHATS_INDEX, now, sessionId);
 }
 
 export async function getChatSessions(limit = 100): Promise<ChatSession[]> {
-  if (!isKvConfigured()) return [];
+  const r = getClient();
+  if (!r) return [];
 
-  const ids = await kv.zrange<string[]>(CHATS_INDEX, 0, limit - 1, {
-    rev: true,
-  });
+  const ids = await r.zrevrange(CHATS_INDEX, 0, limit - 1);
   if (!ids || ids.length === 0) return [];
 
   const sessions = await Promise.all(
-    ids.map((id) => kv.get<ChatSession>(`chat:${id}`))
+    ids.map((id) => safeGet<ChatSession>(`chat:${id}`))
   );
   return sessions.filter((s): s is ChatSession => s !== null);
 }
@@ -133,10 +159,6 @@ export async function getStats(): Promise<{
   totalChats: number;
   leadsToday: number;
 }> {
-  if (!isKvConfigured()) {
-    return { totalLeads: 0, unhandledLeads: 0, totalChats: 0, leadsToday: 0 };
-  }
-
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
 
